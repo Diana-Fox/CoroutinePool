@@ -47,11 +47,16 @@ func (c *CoroutineWorker) RunWork() {
 			case <-tk.C:
 				//去通知池子这个协程可以回收了，但是自己不回收,因为可能并不想回收这个协程
 				c.signal <- c.recyclingCode
+				tk.Reset(c.time)
 			case t := <-c.tasks:
-				t.RunTask() //去运行任务
+				//if t != nil {
+				t.RunTask()
 				fmt.Printf("协程执行任务%s\n", c.recyclingCode)
+				tk.Reset(c.time)
+				//} //可能接收到nil
+			default:
+				continue
 			}
-			tk.Reset(c.time)
 		}
 		fmt.Printf("协程销毁了%s\n", c.recyclingCode)
 	}()

@@ -13,7 +13,7 @@ func TestPool(t *testing.T) {
 	tasks := make(chan task.Task, 5)
 	var wg sync.WaitGroup
 	wg.Add(20)
-	p, err := pool.NewPool(3, 10, time.Second*5, tasks, func() {
+	p, err := pool.NewPool(1, 5, time.Second*2, tasks, func() {
 		fmt.Println("任务被拒绝了")
 	})
 	if err != nil {
@@ -38,7 +38,8 @@ func TestPool(t *testing.T) {
 	//todo 上面是正向流程，已经输出正确结果了，下面会是协程池关闭
 	p.ShutDown()
 	fmt.Println("已经设置为关闭了")
-	time.Sleep(time.Second * 20)
+	time.Sleep(time.Second * 5)
+	fmt.Println("查看一下")
 	//fmt.Println("任务都执行完了")
 
 }

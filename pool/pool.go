@@ -1,10 +1,10 @@
 package pool
 
 import (
+	"fmt"
 	"github.com/Diana-Fox/CoroutinePool/task"
 	"github.com/Diana-Fox/CoroutinePool/worker"
 	"github.com/google/uuid"
-	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -12,170 +12,134 @@ import (
 
 // 池子定义
 type Pool interface {
-	//NewPool(coreSize int, maxSize int,
-	//	keepAliveTime int, time time.Duration,
-	//	taskQueue chan task.Task, reject func()) (Pool, error)
 	Submit(task task.Task) //提交任务
 	ShutDown()             //关闭
 }
 
-func NewPool(coreSize int, maxSize int,
-	keepAliveTime int, time time.Duration,
+func NewPool(coreSize int, maxSize int, keepLive time.Duration,
 	taskQueue chan task.Task, reject func()) (Pool, error) {
-	return &GoroutinePool{}, nil
+	var poolStatus atomic.Uint32
+	poolStatus.Store(PoolRunning) //池子现在是
+	gp := GoroutinePool{
+		workers:    make(map[string]worker.Worker),
+		signal:     make(chan string, maxSize), //最多和协程数量一样多的信息过来，且概率极低
+		poolStatus: poolStatus,
+		coreSize:   coreSize,
+		keepLive:   keepLive,
+		maxSize:    maxSize,
+		tasks:      taskQueue,
+		reject:     reject,
+	}
+	gp.poolMonitor() //开启对池子的监控
+	return &gp, nil
 }
 
 const (
-	PoolInit        = 0 //原始状态
+	PoolRunning     = 0 //原始状态
 	PoolShutDown    = 1 //池子关闭
 	PoolWaitDestroy = 2 //任务已经全部处理完毕，协程可以进行销毁回收了
-	PoolDestroyed   = 3 //监测自毁的也可以自毁了
 )
 
 type GoroutinePool struct {
 	//内部的一些控制
-	runningWorkers map[string]worker.Worker //这个用来存放待回收的协程呢？用map是为了快速往空闲调度
-	idleWorkers    []worker.Worker          //这个是空闲可使用的协程,用这个类型，方便回收的时候做加速
-	currentSize    atomic.Uint32            //当前存活的协程数量
-	signal         chan string              //池和worker通信的信号,方便池子回收
-	poolStatus     atomic.Uint32
-	mx             sync.Mutex
+	workers map[string]worker.Worker //所有的协程
+	//currentSize atomic.Uint32            //当前存活的协程数量
+	signal     chan string //池和worker通信的信号,方便池子回收
+	poolStatus atomic.Uint32
+	mx         sync.Mutex
 	//-----------对用户暴露的参数--------------
-	coreSize      int
-	maxSize       int
-	keepAliveTime int
-	time          time.Duration  //存活时间
-	tasks         chan task.Task //应当限制大小
-	reject        func()
+	coreSize int
+	maxSize  int
+	keepLive time.Duration  //存活时间
+	tasks    chan task.Task //应当限制大小
+	reject   func()
 }
 
 func (g *GoroutinePool) Submit(task task.Task) {
-	if g.poolStatus.Load() >= PoolShutDown {
-		//关闭了，不能再往里面加了,剩下的一些状态变化是为了自毁使用
-		//todo 这里是直接抛异常还是怎么样，待考虑
-	} //这个方法，改成轻逻辑呢？把重逻辑放到调度方法中去
-
+	if g.poolStatus.Load() > PoolRunning {
+		//关闭了，不能再往里面加了
+		//todo 这里是直接抛异常还是怎么样，待考虑，理论上这里应该有异常作为提醒
+	} //
+	//todo 去判断当前有几个worker滴干活
+	if len(g.workers) < g.coreSize {
+		//去增加worker去
+		g.addWorker()
+	} else if len(g.workers) < g.maxSize {
+		//todo 暂时设定，达到核心线程数了，但是没到最大，暂定只有任务数是当前协程数的三倍再考虑开协程
+		if len(g.tasks) > 3*len(g.workers) {
+			g.addWorker()
+		}
+	}
 	select {
 	case g.tasks <- task:
+		//成功提交任务了
 		return
 	default:
-		g.reject() //满了，去执行拒绝策略
+		g.reject() //去执行拒绝策略
 	}
-	//g.mx.Lock()
-	//defer g.mx.Unlock() //执行完就释放掉
-	////没够核心数
-	//if g.currentSize.Load() < uint32(g.coreSize) {
-	//	//二话不说，增加协程
-	//	//todo 这里要控制线程安全，需要上锁，再在这里还要再次判断一下协程数量是否达到上限
-	//	code := uuid.New().String()
-	//	worker.NewWorker(g.signal, code)
-	//	//然后为协程捆绑上当前任务，并且执行
-	//	//当前协程需要在运行协程上登记
-	//	//为总协程数量做++操作
-	//
-	//} else if g.currentSize.Load() < uint32(g.maxSize) {
-	//	//todo 已经超过核心线程数了，但是没达到最大线程数，考虑开辟新的，还是放入队列，后面再讨论
-	//} else {
-	//	//g.tasks <- task
-	//	select {
-	//	case g.tasks <- task:
-	//		return
-	//	default:
-	//		g.reject() //满了，去执行拒绝策略
-	//	}
-	//}
 }
 
 func (g *GoroutinePool) ShutDown() {
-	//TODO implement me
-	panic("implement me")
+	//关闭池子，只能有一个线程成功，别的都白瞎
+	g.poolStatus.CompareAndSwap(PoolRunning, PoolShutDown)
 }
 
-// 去执行任务队列里面的活
-func (g *GoroutinePool) coordinate() {
+// 增加worker数量
+func (g *GoroutinePool) addWorker() {
+	g.mx.Lock()
+	code := uuid.New().String()
+	w := worker.NewWorker(g.tasks, g.signal, code, g.keepLive)
+	w.RunWork()         //开始干活
+	g.workers[code] = w //放进去
+	g.mx.Unlock()
+}
+
+// 去监控池子状态，控制资源回收
+func (g *GoroutinePool) poolMonitor() {
 	go func() {
-		tk := time.NewTicker(g.time)
-		//去读取任务队列的任务
-		for g.poolStatus.Load() < PoolWaitDestroy {
-			select {
-			case <-tk.C:
-				//todo 去释放掉多余的协程
-				g.resetting()
-			case t := <-g.tasks:
-				tk.Reset(g.time) //重置
-				//todo 去拿协调器,拿到后去执行
-				w := g.getWorker()
-				for w == nil { //拿不到空闲就一直去尝试拿取
-					//先把协程执行权让出去，因为拿不到空闲是需要等待别的执行完的
-					runtime.Gosched()
-					w = g.getWorker()
+		//在自毁状态之前都需要监控
+		for g.poolStatus.Load() != PoolWaitDestroy { //池子没到自毁之前
+			//池子
+			//运行中的概率最高，往前放放
+			if g.poolStatus.Load() == PoolRunning {
+				select {
+				case code := <-g.signal:
+					//要是当前协程数量比核心协程多，并且协程数量还是任务数量的2倍时，就自我了结
+					//这个判断主要是为了保住核心协程，避免重复开启核心协程
+					if g.coreSize < len(g.workers) && len(g.workers)*2 > len(g.tasks) {
+						g.workOver(code)
+					}
 				}
-				//拿到了，去设置任务，协程会自动去执行，能拿到，肯定是空闲的
-				w.SetWork(t)
+			} else if g.poolStatus.Load() == PoolShutDown {
+				if len(g.workers) == 0 && len(g.signal) == 0 {
+					//关闭了，并且worker全自毁了,跳出这个循环，去关闭信道
+					fmt.Println("协程全自毁了,该去关信道了")
+					g.poolStatus.Store(PoolWaitDestroy)
+					break
+				}
+				//协程池已经不接收新任务了，这时的超时，等于是可以直接回收了
+				select {
+				case code := <-g.signal:
+					fmt.Printf("接收到的code:%s\n", code)
+					g.workOver(code) //work去自毁
+				}
 			}
 		}
+		//fmt.Printf("信号的长度%d", len(g.signal))
+		//fmt.Printf("协程的长度%d", len(g.tasks))
+		close(g.tasks)
+		close(g.signal)
 	}()
 }
 
-// 去拿一个空闲的worker
-func (g *GoroutinePool) getWorker() worker.Worker {
-	//g.mx.Lock()
-	//defer g.mx.Unlock()
-	if len(g.idleWorkers) > 0 {
-		//element := g.idleWorkers.Front()
-		//w := element.Value.(worker.Worker)
-		//去取一个可以用的work
-		w := g.idleWorkers[len(g.idleWorkers)]             //去取最后一个协程
-		g.idleWorkers = g.idleWorkers[:len(g.idleWorkers)] //空闲协程少一个
-		code := w.GetRecyclingCode()
-		g.runningWorkers[code] = w //运行协程多一个
-		return w
-	} else if g.currentSize.Load() < uint32(g.maxSize) {
-		//没到最大线程数，去开新的协程
-		w := worker.NewWorker(g.signal, uuid.New().String())
-		g.runningWorkers[w.GetRecyclingCode()] = w
-		g.currentSize.Add(1) //开启的总协程数要多一个
-		return w
-	} else {
-		//没拿到
-		return nil
-	}
-}
-
-// 恢复到空闲中去
-func (g *GoroutinePool) recovery() {
-	go func() {
-		//任务没处理完之前，都要将空闲线程归位，用于调度
-		for g.poolStatus.Load() < PoolWaitDestroy {
-			select {
-			case s := <-g.signal:
-				//对这两个集合的操作，必须上锁
-				g.mx.Lock()
-				//取出要归位的空闲协程
-				w := g.runningWorkers[s]
-				w.RunWork() //启动
-				g.idleWorkers = append(g.idleWorkers, w)
-				//g.idleWorkers.PushBack(w) //重新放回去
-				g.mx.Unlock()
-			}
-		}
-	}()
-}
-
-// 重置协程的个数,为什么统一回收呢，因为当有一个
-func (g *GoroutinePool) resetting() {
-	//todo 只有在长时间没有任务的时候才会重置，所以协程必然全是空闲的
-	if g.currentSize.Load() > uint32(g.coreSize) {
-		g.mx.Lock()
-		releases := g.idleWorkers[g.coreSize:] //得到所有需要被释放掉的协程
-		g.idleWorkers = g.idleWorkers[:g.coreSize]
-		g.mx.Unlock()
-		go func() {
-			//todo 去挨个结束掉他们
-			for i := 0; i < len(releases); i++ {
-				releases[i].OverWorker()
-			}
-			//执行完成的时候，releases对象会被回收掉
-		}()
-	}
+// 协程狗带
+func (g *GoroutinePool) workOver(code string) {
+	g.mx.Lock()
+	defer g.mx.Unlock()
+	//去回收掉这个协程
+	w := g.workers[code]
+	//fmt.Println(w.GetRecyclingCode())
+	w.OverWorker()
+	//移除出去
+	delete(g.workers, w.GetRecyclingCode())
 }

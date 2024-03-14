@@ -1,15 +1,16 @@
 package worker
 
 import (
+	"fmt"
 	"github.com/Diana-Fox/CoroutinePool/task"
 	"sync/atomic"
+	"time"
 )
 
 type Worker interface {
-	RunWork()               //启动协程
-	SetWork(task task.Task) //方便回收调度
-	GetRecyclingCode() string
-	OverWorker() //结束协程
+	RunWork()                 //启动协程
+	GetRecyclingCode() string //获取控制码
+	OverWorker()              //结束协程
 }
 
 const (
@@ -20,52 +21,50 @@ const (
 )
 
 type CoroutineWorker struct {
-	task         task.Task     //要有个任务
-	taskStatus   atomic.Uint32 //任务的状态
-	workerStatus atomic.Bool   //任务协程的生死
-	signal       chan string   //方便任务完成的时候，归入空闲协程
-	//one           sync.Once     //控制只能启动一次协程
-	recyclingCode string //回收码
+	tasks         chan task.Task //要有个任务
+	workerStatus  atomic.Bool    //任务协程的生死
+	signal        chan string    //方便任务完成的时候，归入空闲协程
+	recyclingCode string         //回收码,为了实现指定协程的回收
+	time          time.Duration  //提醒时间
+}
+
+func NewWorker(tasks chan task.Task, signal chan string, recyclingCode string, time time.Duration) Worker {
+	var workerStatus atomic.Bool
+	workerStatus.Store(true) //初始化
+	return &CoroutineWorker{
+		tasks:         tasks,
+		workerStatus:  workerStatus,
+		signal:        signal,
+		recyclingCode: recyclingCode,
+		time:          time,
+	}
+}
+func (c *CoroutineWorker) RunWork() {
+	go func() {
+		tk := time.NewTicker(c.time)
+		for c.workerStatus.Load() { //协程还没被弄死
+			select {
+			case <-tk.C:
+				//去通知池子这个协程可以回收了，但是自己不回收,因为可能并不想回收这个协程
+				c.signal <- c.recyclingCode
+			case t := <-c.tasks:
+				t.RunTask() //去运行任务
+				fmt.Printf("协程执行任务%s\n", c.recyclingCode)
+			}
+			tk.Reset(c.time)
+		}
+		fmt.Printf("协程销毁了%s\n", c.recyclingCode)
+	}()
 }
 
 func (c *CoroutineWorker) GetRecyclingCode() string {
 	return c.recyclingCode
 }
 
-func NewWorker(signal chan string, recyclingCode string) Worker {
-	return &CoroutineWorker{
-		signal:        signal,
-		recyclingCode: recyclingCode,
-	}
-}
-
-func (c *CoroutineWorker) SetWork(task task.Task) {
-	//原本状态为可接收时
-	if c.taskStatus.CompareAndSwap(Acceptable, Ready) {
-		//之前是空闲状态，可以接收任务
-		c.task = task
-		//原本状态为执行
-		c.taskStatus.CompareAndSwap(Ready, Running)
-	}
-}
-
-func (c *CoroutineWorker) RunWork() {
-	//c.one.Do(func() { //控制只能启动一次，不允许重复启动,不过启动命令本来就是内部调用一次，也用不着这个了吧
-	go func() {
-		//初始化的时候，会将状态设置为可启动
-		for c.workerStatus.Load() { //状态是活着的时候
-			if c.taskStatus.CompareAndSwap(Running, Execute) {
-				c.task.RunTask()
-				//活干完了，重置回待接收状态
-				c.taskStatus.Store(Acceptable)
-				//给通信信道发消息，让信道方便回收
-				c.signal <- c.recyclingCode
-			}
-		}
-	}()
-	//})
-}
 func (c *CoroutineWorker) OverWorker() {
 	//让协程自己结束
+	//if c.workerStatus.CompareAndSwap(true, false) {
+	//	fmt.Printf("已接收结束信号%s", c.recyclingCode)
+	//}
 	c.workerStatus.Store(false)
 }

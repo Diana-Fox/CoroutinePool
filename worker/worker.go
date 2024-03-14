@@ -49,13 +49,13 @@ func (c *CoroutineWorker) RunWork() {
 				c.signal <- c.recyclingCode
 				tk.Reset(c.time)
 			case t := <-c.tasks:
-				//if t != nil {
-				t.RunTask()
-				fmt.Printf("协程执行任务%s\n", c.recyclingCode)
-				tk.Reset(c.time)
-				//} //可能接收到nil
-			default:
-				continue
+				if t != nil {
+					t.RunTask()
+					fmt.Printf("协程执行任务%s\n", c.recyclingCode)
+					tk.Reset(c.time)
+				} //可能接收到nil
+				//default:
+				//	continue
 			}
 		}
 		fmt.Printf("协程销毁了%s\n", c.recyclingCode)

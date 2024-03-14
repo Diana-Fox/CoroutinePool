@@ -13,7 +13,7 @@ func TestPool(t *testing.T) {
 	tasks := make(chan task.Task, 5)
 	var wg sync.WaitGroup
 	wg.Add(20)
-	p, err := pool.NewPool(1, 5, time.Second*2, tasks, func() {
+	p, err := pool.NewPool(2, 5, time.Second*2, tasks, func() {
 		fmt.Println("任务被拒绝了")
 	})
 	if err != nil {

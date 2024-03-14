@@ -138,8 +138,10 @@ func (g *GoroutinePool) workOver(code string) {
 	defer g.mx.Unlock()
 	//去回收掉这个协程
 	w := g.workers[code]
-	//fmt.Println(w.GetRecyclingCode())
-	w.OverWorker()
-	//移除出去
-	delete(g.workers, w.GetRecyclingCode())
+	if w != nil {
+		//fmt.Println(w.GetRecyclingCode())
+		w.OverWorker()
+		//移除出去
+		delete(g.workers, w.GetRecyclingCode())
+	}
 }
